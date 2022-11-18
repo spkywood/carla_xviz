@@ -1,63 +1,65 @@
-"""
-    Carla Visualization
-"""
-
-import math
 import os, sys
+import math
 import carla
 from loguru import logger
 import traceback
+from queue import Queue
+from time import sleep
+import cv2
+import numpy as np
 
-from xviz_avs import XVIZBuilder, \
-    XVIZMetadataBuilder, \
-    ANNOTATION_TYPES,\
-    CATEGORY,\
-    COORDINATE_TYPES,\
-    SCALAR_TYPE,\
-    PRIMITIVE_TYPES,\
-    UIPRIMITIVE_TYPES
-
-from xviz_avs.builder.xviz_ui_builder import XVIZContainerBuilder,\
-    XVIZBaseUiBuilder,\
-    XVIZMetricBuilder,\
-    XVIZPanelBuilder,\
-    XVIZPlotBuilder,\
-    XVIZSelectBuilder,\
-    XVIZTableBuilder,\
-    XVIZTreeTableBuilder,\
-    XVIZUIBuilder,\
-    XVIZVideoBuilder
-
-
-from xviz_avs.builder.declarative_ui import UI_TYPES, UI_LAYOUT, UI_INTERACTIONS
+import matplotlib.pyplot as plt
 
 DEG_1_AS_RAD  = math.pi / 180
 DEG_90_AS_RAD = 90 * DEG_1_AS_RAD
 M_PI		  = 3.14159265358979323846
 
 class CarlaScenario:
+    """
+        c_client: carla client
+        c_map: Carla map
+    """
     def __init__(self, host='localhost', port=2000, time_out=3) -> None:
         self._host = host
         self._port = port
         self._timeout = time_out
+
+        self.run = True
 
         self.start_time = None
         self.end_time = None
 
         self.ego_vehicle = None
 
+        self.traffic_lights = {}  # {id, []}
+        
+        self.c_client = None
+        self.c_world = None
+        self.c_map = None
+        
+        self.listen_sensor = {}
+        self.frame_queue_ = Queue()
+        self.imu_queue_ = Queue()
+        self.image_queue_ = Queue()
+        self.ego_acc = Queue()
+        self.ego_vel = Queue()
+
     def get_client(self):
         try:
-            client = carla.Client(self._host, self._port)
-            client.set_timeout(self._timeout)
+            self.c_client = carla.Client(self._host, self._port)
+            self.c_client.set_timeout(self._timeout)
 
-            return client
+            self.c_world = self.c_client.get_world()
+            self.c_map = self.c_world.get_map()
         except:
             logger.info(traceback.format_exc())
 
     # get map json
-    def get_map_json(self, map):
-        topology = map.get_topology()
+    def get_map_json(self):
+        if self.c_map is None:
+            self.get_client()
+
+        topology = self.c_map.get_topology()
 
         map_json = {}
         map_json["type"] = "FeatureCollection"
@@ -119,182 +121,148 @@ class CarlaScenario:
 
         map_dict["features"].append(feature)
 
+    @staticmethod
+    def _imu_callback(data, id, queue):
+        queue.put_nowait({data.frame: {id : data}})
 
-    def get_metabuilder(self):
-        builder = XVIZMetadataBuilder()
-        builder.stream("/vehicle_pose")\
-            .category(CATEGORY.POSE)
+    @staticmethod
+    def _image_callback(data, id, queue):
+        queue.put_nowait({data.frame: {id : data}})
 
-        builder.stream("/game/time").category(CATEGORY.UI_PRIMITIVE)
+    @staticmethod
+    def compute_speed(v):
+        return math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
 
-        builder.stream("/object/vehicles")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.POLYGON)\
-            .coordinate(COORDINATE_TYPES.IDENTITY)\
-            .stream_style({
-                'extruded' : True,
-                'fill_color' : [200, 200, 0, 128],
-                "height" : 2.0
-            })
+    def register_sensor(self):
+        if self.c_world is None:
+            self.get_client()
 
-        builder.stream("/object/walkers")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.POLYGON)\
-            .coordinate(COORDINATE_TYPES.IDENTITY)\
-            .stream_style({
-                "extruded": True,
-                "fill_color": [0, 200, 70, 128],
-                "height": 1.5
-            })
+        actor_list = self.c_world.get_actors()
+        # logger.info(actor_list)
 
-        builder.stream("/object/tracking_vehicles")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.CIRCLE)\
-            .coordinate(COORDINATE_TYPES.IDENTITY)\
-            .stream_style({
-                'fill_color' : [200, 200, 0, 128]
-            })
+        # sensor = None
+        for actor in actor_list:
+            actor_type = actor.type_id
+            sensor = self.c_world.get_actor(actor.id)
+            if actor_type == 'sensor.other.imu':
+                sensor_id = sensor.id 
+                if not self.listen_sensor.get(actor_list):
+                    self.listen_sensor[sensor_id] = sensor
+    
+                    sensor.listen(lambda data: CarlaScenario._imu_callback(data, sensor_id, self.imu_queue_))
+            elif actor_type == 'sensor.camera.rgb':
+                sensor_id = sensor.id
+                if not self.listen_sensor.get(actor_list):
+                    self.listen_sensor[sensor_id] = sensor
+                    sensor.listen(lambda data: CarlaScenario._image_callback(data, sensor_id, self.image_queue_))
+            else:
+                pass
 
-        builder.stream("/object/tracking_walkers")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.CIRCLE)\
-            .coordinate(COORDINATE_TYPES.IDENTITY)\
-            .stream_style({
-                "fill_color": [0, 200, 70, 128]
-            })
+        # for snapshot in snapshots:
+        #     id = snapshot.id
+        #     actor = 
+        #     if self.ego_vehicle is not None:
+        #         continue
+            
+        #     for _key, _value in actor.attributes.items():
+        #         if (_key == "role_name" and _value == "ego_vehicle"):
+        #             self.ego_vehicle = actor
+        #             logger.info('{} : {}'.format(_key, _value))
+    
+    def sensor_process(self):
+        plt.ion()   
+        # plt.style.use("ggplot")
+        # fig, ax = plt.subplots(figsize=(12, 7))
+        acc_list = []
+        vel_list = []
+        x = []
+        i = 0.05
+        while self.run:
+            frame_id = self.frame_queue_.get()
+            imu_data = self.imu_queue_.get()
+            if imu_data:
+                imu = imu_data.get(frame_id)
+                # if imu:
+                #     logger.info(imu)
 
-        builder.stream("/vehicle/acceleration")\
-            .category(CATEGORY.TIME_SERIES)\
-            .unit("m/s^2")\
-            .type(SCALAR_TYPE.FLOAT)
-        
-        builder.stream("/vehicle/velocity")\
-            .category(CATEGORY.TIME_SERIES)\
-            .unit("m/s")\
-            .type(SCALAR_TYPE.FLOAT)
+            image_data = self.image_queue_.get()
+            if image_data:
+                img = image_data.get(frame_id-1)
+                if img:
+                    for k, v in img.items():
+                        array = np.frombuffer(v.raw_data, dtype=np.dtype("uint8"))
+                        array = np.reshape(array, (v.height, v.width, 4))
+                        array = array[:, :, :3]
+                        cv2.imshow('img', array)
+                        cv2.waitKey(1)
+                        # cv2.imwrite('_out/{}.png'.format(frame_id), array)
+            
+            # acc_data = self.ego_acc.get()
+            # if acc_data:
+            #     acc = acc_data.get(frame_id)
+            #     acc = CarlaScenario.compute_speed(acc)
+            #     # logger.info('{} : {} - {} -{}'.format(frame_id, acc.x, acc.y, acc.z))
+            #     logger.info(acc)
+            #     acc_list.append(acc)
 
-        builder.stream("/traffic/stop_signs")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.POLYLINE)\
-            .stream_style({
-                "stroke_width": 0.1,
-                "stroke_color": [200, 200, 0, 128]
-            })\
-            .style_class("vertical", {"stroke_width": 0.2, "stroke_color": [200, 200, 0, 128]})
+            # vel_data = self.ego_vel.get()
+            # if vel_data:
+            #     vel = vel_data.get(frame_id)
+            #     vel = CarlaScenario.compute_speed(vel)
+            #     logger.info(vel)
+            #     vel_list.append(vel)
+            #     # logger.info('{} : {} - {} -{}'.format(frame_id, vel.x, vel.y, vel.z))
 
-        builder.stream("/traffic/traffic_lights")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.POLYGON)\
-            .coordinate(COORDINATE_TYPES.IDENTITY)\
-            .stream_style({
-                "extruded": True, 
-                "height": 0.1
-            })\
-            .style_class("red_state", {"fill_color": [200, 200, 0, 128]})\
-            .style_class("yellow_state", {"fill_color": [200, 200, 0, 128]})\
-            .style_class("green_state", {"fill_color": [200, 200, 0, 128]})\
-            .style_class("unknown", {"fill_color": [200, 200, 0, 128]})
-        
-        builder.stream("/lidar/points")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.POINT)\
-            .coordinate(COORDINATE_TYPES.IDENTITY)\
-            .stream_style({
-                "point_color_mode" : "ELEVATION",
-                "radius_pixels" : 2
-            })
+            # x.append(i)
+            # i+=0.05
+            # plt.clf() 
+            # plt.plot(x, acc_list)
+            # plt.plot(x, vel_list)
+            # plt.pause(0.001)
 
-        builder.stream("/radar/points")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.POINT)\
-            .coordinate(COORDINATE_TYPES.IDENTITY)\
-            .stream_style({
-                "radius_pixels" : 2
-            })
+    # def image_process(self):
+    #     while self.run:
+    #         frame_id = self.frame_queue_.get()
+    #         # logger.info(frame_id)
+    #         imu_data = self.imu_queue_.get(frame_id)
+    #         if imu_data:
+    #             logger.info(imu_data)
 
-        builder.stream("/drawing/polylines")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.POLYLINE)\
-            .coordinate(COORDINATE_TYPES.IDENTITY)\
-            .stream_style({
-                "stroke_color" : [200, 200, 0, 128],
-            "stroke_width" : 2.0
-        })
-        
-        builder.stream("/drawing/points")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.POLYLINE)\
-            .coordinate(COORDINATE_TYPES.IDENTITY)
+    def get_update_data(self):
+        if self.c_world is None:
+            self.get_client()
 
-        builder.stream("/drawing/texts")\
-            .category(CATEGORY.PRIMITIVE)\
-            .type(PRIMITIVE_TYPES.TEXT)\
-            .coordinate(COORDINATE_TYPES.IDENTITY)
-        
-        builder.stream("/sensor/other/collision")\
-            .category(CATEGORY.UI_PRIMITIVE)
+        snapshots = self.c_world.wait_for_tick(seconds=2.0)
 
-        builder.stream("/sensor/other/gnss")\
-            .category(CATEGORY.UI_PRIMITIVE)
-
-        builder.stream("/sensor/other/imu")\
-            .category(CATEGORY.UI_PRIMITIVE)
-
-        builder.ui(self.get_ui([], ['/vehicle/acceleration'], ['/vehicle/velocity'], []))
-
-        return builder
-
-    def get_ui(self, cameras, acceleration_stream, velocity_stream, table_streams):
-        ui_builder = XVIZUIBuilder()
-        
-        metrics = ui_builder.panel("Metrics")
-
-        metrics_builder = ui_builder.container('metrics')
-        metrics_builder.child(ui_builder.metric(streams=acceleration_stream, 
-                                                  title='acceleration',
-                                                  description='acceleration'))
-        metrics_builder.child(ui_builder.metric(streams=velocity_stream,
-                                                  title='velocity',
-                                                  description='velocity'))
-        metrics.child(metrics_builder)
-
-        tables = ui_builder.panel("Tables")
-        tables_builder = ui_builder.container('tables')
-        tables_builder.child(ui_builder.table(stream="/game/time",
-                                             title="time",
-                                             description="/game/time"))
-        tables_builder.child(ui_builder.table(stream="/sensor/other/collision",
-                                             title="Collision",
-                                             description="/sensor/other/collision"))
-        tables_builder.child(ui_builder.table(stream="/sensor/other/gnss",
-                                             title="GNSS",
-                                             description="/sensor/other/gnss"))
-        tables_builder.child(ui_builder.table(stream="/sensor/other/imu",
-                                             title="Imu",
-                                             description="/sensor/other/imu"))
-        tables.child(tables_builder)
-
-        ui_builder.child(metrics)
-        ui_builder.child(tables)
-        
-        return ui_builder
-
-    def get_update_data(self, world):
-        world_snapshots = world.wait_for_tick(seconds=30)
-
-        now_time = world_snapshots.timestamp.elapsed_seconds
-        now_frame = world_snapshots.frame
+        now_time = snapshots.timestamp.elapsed_seconds
+        now_frame = snapshots.frame
+        # logger.info(now_frame)
+        self.frame_queue_.put_nowait(now_frame)
 
         if self.start_time is None:
             self.start_time = now_time
-
-        for world_snapshot in world_snapshots:
-            id = world_snapshot.id
-            actor = world.get_actor(id)
-            if self.ego_vehicle is not None:
-                continue
+        
+        if self.ego_vehicle is None:
             
-            for _key, _value in actor.attributes.items():
-                if (_key == "role_name" and _value == "ego_vehicle"):
-                    self.ego_vehicle = actor
-                    logger.info('{} : {}'.format(_key, _value))
+            for snapshot in snapshots:
+                id = snapshot.id
+                actor = self.c_world.get_actor(id)
+            
+                for _key, _value in actor.attributes.items():
+                    if (_key == "role_name" and _value == "ego_vehicle"):
+                        self.ego_vehicle = actor
+                        logger.info('{} : {}'.format(_key, _value))
+        
+        self.ego_acc.put_nowait({now_frame : self.ego_vehicle.get_acceleration()})
+        self.ego_vel.put_nowait({now_frame : self.ego_vehicle.get_velocity()})
+
+    def traffic_ight_areas(self, actor):
+        pass
+
+    def stop_sign_areas(self, actor):
+        pass
+
+    def clear(self):
+        for k, v in self.listen_sensor.items():
+            logger.info('stop subscribe from {} : {}'.format(k, v))
+            v.stop()
